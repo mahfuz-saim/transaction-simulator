@@ -1,0 +1,239 @@
+FUNCTION evaluateLiquidityHealth(agent, transaction):
+
+    liquidityRiskScore = 0
+    reasons = []
+    replenishRequired = FALSE
+
+    ##################################################
+    ## 1. Current State
+    ##################################################
+
+    currentCash      = agent.CashBalance
+    currentEMoney    = agent.EMoneyBalance
+    providerBalances = agent.ProviderBalances        # map: provider -> balance
+    totalLiquidity   = currentCash + currentEMoney
+
+    cashRatio   = IF totalLiquidity > 0 THEN currentCash   / totalLiquidity ELSE 0.5
+    emoneyRatio = IF totalLiquidity > 0 THEN currentEMoney / totalLiquidity ELSE 0.5
+
+    ##################################################
+    ## 2. Rolling Windows
+    ##################################################
+
+    txns30Min = getTransactions(agent, window="30 minutes")
+    txns1Hr   = getTransactions(agent, window="1 hour")
+    txns3Hr   = getTransactions(agent, window="3 hours")
+    lastN     = getLastTransactions(agent, limit=20)
+
+    cashIn30,  cashOut30  = sumByType(txns30Min)
+    cashIn1h,  cashOut1h  = sumByType(txns1Hr)
+    cashIn3h,  cashOut3h  = sumByType(txns3Hr)
+
+    ##################################################
+    ## 3. Net Flow / Momentum
+    ##################################################
+
+    netFlow30 = cashIn30 - cashOut30
+    netFlow1h = cashIn1h - cashOut1h
+
+    totalFlow1h = cashIn1h + cashOut1h
+    momentumMagnitude = IF totalFlow1h > 0
+                            THEN ABS(netFlow1h) / totalFlow1h   # 0..1
+                            ELSE 0
+
+    # Which side is trending toward exhaustion?
+    IF netFlow1h < 0
+        sideAtRisk = "CASH"          # more cash-out than cash-in
+    ELSE IF netFlow1h > 0
+        sideAtRisk = "EMONEY"        # more cash-in than cash-out
+    ELSE
+        sideAtRisk = "NONE"
+
+    ##################################################
+    ## 4. Burn Rate & Depletion Estimate
+    ##################################################
+
+    cashBurnPerMin   = computeBurnRate(txns1Hr, direction="CASH_DECREASING")
+    emoneyBurnPerMin = computeBurnRate(txns1Hr, direction="EMONEY_DECREASING")
+
+    estCashDepletionMin   = IF cashBurnPerMin   > 0 THEN currentCash   / cashBurnPerMin   ELSE INFINITY
+    estEMoneyDepletionMin = IF emoneyBurnPerMin > 0 THEN currentEMoney / emoneyBurnPerMin ELSE INFINITY
+
+    ##################################################
+    ## 5. Consecutive Trend
+    ##################################################
+
+    consecutiveCashOut = countConsecutiveType(lastN, "CASH_OUT")
+    consecutiveCashIn  = countConsecutiveType(lastN, "CASH_IN")
+
+    ##################################################
+    ## 6. Time-of-Day Expected Pattern
+    ##################################################
+
+    currentHour     = HOUR(transaction.Timestamp)
+    dayOfWeek       = DAY_OF_WEEK(transaction.Timestamp)
+    expectedCashInRatio = getHistoricalHourlyPattern(agent, dayOfWeek, currentHour)  # 0..1
+    actualCashInRatio   = IF totalFlow1h > 0 THEN cashIn1h / totalFlow1h ELSE expectedCashInRatio
+    patternDeviation    = ABS(actualCashInRatio - expectedCashInRatio)   # 0..1
+
+    ##################################################
+    ## 7. Volatility
+    ##################################################
+
+    avgAmount    = average(lastN.Amount)
+    stdDevAmount = standardDeviation(lastN.Amount)
+    isVolatileSpike = (avgAmount > 0) AND
+                       (transaction.Amount > avgAmount + 3 * stdDevAmount)
+
+    ##################################################
+    ## 8. Weighted Core Score  (Rules 1–6, sums to 100)
+    ##################################################
+
+    # -- Cash Ratio component (weight 20) --
+    cashRatioRisk = (1 - cashRatio) * 20
+    IF sideAtRisk == "CASH"
+        liquidityRiskScore += cashRatioRisk
+        IF cashRatio < 0.15
+            reasons += "Cash ratio critically low (" + cashRatio*100 + "%)"
+
+    # -- E-money Ratio component (weight 20) --
+    emoneyRatioRisk = (1 - emoneyRatio) * 20
+    IF sideAtRisk == "EMONEY"
+        liquidityRiskScore += emoneyRatioRisk
+        IF emoneyRatio < 0.15
+            reasons += "E-money ratio critically low (" + emoneyRatio*100 + "%)"
+
+    # -- Momentum component (weight 20) --
+    momentumScore = momentumMagnitude * 20
+    liquidityRiskScore += momentumScore
+    IF momentumMagnitude > 0.6
+        reasons += "Strong net flow imbalance in last hour (" +
+                   (IF netFlow1h > 0 THEN "cash accumulating" ELSE "cash draining") + ")"
+
+    # -- Burn Rate component (weight 20) --
+    DEPLETION_CRITICAL_MIN = 60
+    burnScore = 0
+    IF sideAtRisk == "CASH" AND estCashDepletionMin < DEPLETION_CRITICAL_MIN
+        burnScore = 20 * (1 - estCashDepletionMin / DEPLETION_CRITICAL_MIN)
+        reasons += "Estimated cash depletion in " + ROUND(estCashDepletionMin) + " minutes"
+    ELSE IF sideAtRisk == "EMONEY" AND estEMoneyDepletionMin < DEPLETION_CRITICAL_MIN
+        burnScore = 20 * (1 - estEMoneyDepletionMin / DEPLETION_CRITICAL_MIN)
+        reasons += "Estimated e-money depletion in " + ROUND(estEMoneyDepletionMin) + " minutes"
+    liquidityRiskScore += CLAMP(burnScore, 0, 20)
+
+    # -- Consecutive Trend component (weight 10) --
+    trendScore = 0
+    IF consecutiveCashOut >= 5
+        trendScore = MIN(10, (consecutiveCashOut - 4) * 2)
+        reasons += consecutiveCashOut + " consecutive Cash-Out transactions"
+    ELSE IF consecutiveCashIn >= 5
+        trendScore = MIN(10, (consecutiveCashIn - 4) * 2)
+        reasons += consecutiveCashIn + " consecutive Cash-In transactions"
+    liquidityRiskScore += trendScore
+
+    # -- Time-of-Day Deviation component (weight 10) --
+    timeScore = patternDeviation * 10
+    liquidityRiskScore += timeScore
+    IF patternDeviation > 0.4
+        reasons += "Current activity deviates from usual hourly pattern"
+
+    ##################################################
+    ## 9. Extra Shock Rules (additive, not part of the 100-base weights)
+    ##################################################
+
+    # Rule 7 — Large Single Transaction Shock
+    IF transaction.Type == "CASH_OUT" AND currentCash > 0
+       AND transaction.Amount > currentCash * 0.5
+        liquidityRiskScore += 10
+        reasons += "Single transaction consumed 50%+ of available cash"
+        replenishRequired = TRUE
+
+    IF transaction.Type == "CASH_IN" AND currentEMoney > 0
+       AND transaction.Amount > currentEMoney * 0.5
+        liquidityRiskScore += 10
+        reasons += "Single transaction consumed 50%+ of available e-money"
+        replenishRequired = TRUE
+
+    # Rule 9 — Provider-wise Imbalance
+    MIN_PROVIDER_RATIO = 0.10
+    totalProviderBalance = SUM(providerBalances.values)
+    FOR EACH (provider, balance) IN providerBalances
+        providerRatio = IF totalProviderBalance > 0 THEN balance / totalProviderBalance ELSE 0
+        IF providerRatio < MIN_PROVIDER_RATIO
+            liquidityRiskScore += 5
+            reasons += "Low liquidity on provider: " + provider +
+                       " (" + ROUND(providerRatio*100) + "% of e-money)"
+
+    # Rule 10 — Volatility Spike
+    IF isVolatileSpike
+        liquidityRiskScore += 8
+        reasons += "Unusually large/volatile transaction detected — reserve buffer recommended"
+
+    ##################################################
+    ## 10. Clamp & Convert to Health Score
+    ##################################################
+
+    liquidityRiskScore = CLAMP(liquidityRiskScore, 0, 100)
+    healthScore = 100 - liquidityRiskScore
+
+    ##################################################
+    ## 11. Tier Classification
+    ##################################################
+
+    IF healthScore >= 75
+        tier = "HEALTHY"
+    ELSE IF healthScore >= 50
+        tier = "MODERATE"
+    ELSE IF healthScore >= 25
+        tier = "AT_RISK"
+    ELSE
+        tier = "CRITICAL"
+
+    ##################################################
+    ## 12. Replenishment Decision
+    ##################################################
+
+    IF tier IN ["AT_RISK", "CRITICAL"]
+        replenishRequired = TRUE
+
+    ##################################################
+    ## 13. Recommendation (deterministic, LLM-free)
+    ##################################################
+
+    recommendation = NULL
+    IF replenishRequired
+        IF sideAtRisk == "CASH"
+            suggestedAmount = MAX(cashOut1h - cashIn1h, currentCash * 0.5)
+            recommendation = "Transfer approx ৳" + ROUND(suggestedAmount) +
+                              " physical cash to this agent."
+        ELSE IF sideAtRisk == "EMONEY"
+            suggestedAmount = MAX(cashIn1h - cashOut1h, currentEMoney * 0.5)
+            recommendation = "Top up approx ৳" + ROUND(suggestedAmount) +
+                              " e-money (check provider-level shortfall above)."
+
+    ##################################################
+    ## 14. Return
+    ##################################################
+
+    RETURN {
+        agentId          : agent.AgentID,
+        healthScore      : healthScore,
+        riskScore        : liquidityRiskScore,
+        tier             : tier,
+        replenishRequired: replenishRequired,
+        reasons          : reasons,
+        recommendation   : recommendation,
+        metadata: {
+            currentCash            : currentCash,
+            currentEMoney          : currentEMoney,
+            cashRatio              : cashRatio,
+            emoneyRatio            : emoneyRatio,
+            netFlow1h              : netFlow1h,
+            sideAtRisk             : sideAtRisk,
+            estCashDepletionMin    : estCashDepletionMin,
+            estEMoneyDepletionMin  : estEMoneyDepletionMin,
+            consecutiveCashOut     : consecutiveCashOut,
+            consecutiveCashIn      : consecutiveCashIn,
+            providerBalances       : providerBalances
+        }
+    }

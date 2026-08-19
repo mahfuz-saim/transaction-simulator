@@ -1,0 +1,345 @@
+FUNCTION evaluateRisk(transaction):
+
+    riskScore = 0
+    reasons = []
+    reviewRequired = FALSE
+
+    ##################################################
+    ## 1. Fetch Customer Historical Context
+    ##################################################
+
+    # Transaction History
+    lastNTxns         = getLastTransactions(transaction.CustomerAccount, limit=20)
+    totalHistoryCount = getTotalTransactionCount(transaction.CustomerAccount)
+
+    # Amount Baseline
+    avgAmount   = average(lastNTxns.Amount)
+    medAmount   = median(lastNTxns.Amount)
+    maxAmount   = max(lastNTxns.Amount)
+
+    # Velocity Counts
+    txns1Min    = countTransactions(transaction.CustomerAccount, window="1 minute")
+    txns5Min    = countTransactions(transaction.CustomerAccount, window="5 minutes")
+    txns30Min   = countTransactions(transaction.CustomerAccount, window="30 minutes")
+
+    # Failed Attempts
+    failedCount = countTransactions(
+                      transaction.CustomerAccount,
+                      status="FAILED",
+                      window="10 minutes"
+                  )
+
+    # Repeated Amount (Time-Bucketed)
+    sameAmt1Min = countTransactions(
+                      transaction.CustomerAccount,
+                      amount=transaction.Amount,
+                      window="1 minute"
+                  )
+    sameAmt5Min = countTransactions(
+                      transaction.CustomerAccount,
+                      amount=transaction.Amount,
+                      window="5 minutes"
+                  )
+    sameAmt15Min = countTransactions(
+                      transaction.CustomerAccount,
+                      amount=transaction.Amount,
+                      window="15 minutes"
+                  )
+    sameAmt30Min = countTransactions(
+                      transaction.CustomerAccount,
+                      amount=transaction.Amount,
+                      window="30 minutes"
+                  )
+
+    # Provider Diversity
+    providersUsed = distinctProviders(
+                        transaction.CustomerAccount,
+                        window="30 minutes"
+                    )
+
+    # Previous Transaction
+    prevTxn     = getLastTransaction(transaction.CustomerAccount)
+    prevChannel = prevTxn.Channel   IF prevTxn EXISTS ELSE NULL
+    prevType    = prevTxn.Type      IF prevTxn EXISTS ELSE NULL
+    prevTime    = prevTxn.Timestamp IF prevTxn EXISTS ELSE NULL
+    prevAgentID = prevTxn.AgentID   IF prevTxn EXISTS ELSE NULL
+
+    # Agent Location Context
+    currentAgentLocation = getAgentLocation(transaction.AgentID)
+    recentAgentLocations = distinctAgentLocations(
+                               transaction.CustomerAccount,
+                               window="60 minutes"
+                           )
+    homeAgentLocations   = frequentAgentLocations(
+                               transaction.CustomerAccount,
+                               window="90 days",
+                               topN=3
+                           )
+
+    # Active Hours Profile
+    activeHours = getActiveHourProfile(transaction.CustomerAccount)
+    currentHour = HOUR(transaction.Timestamp)
+
+    ##################################################
+    ## 2. Positive Rules (Established Trust)
+    ##################################################
+
+    # Normal Amount Range
+    IF avgAmount > 0
+       AND ABS(transaction.Amount - avgAmount) <= (avgAmount * 0.20)
+        riskScore -= 8
+
+    # Long-Standing Customer
+    IF totalHistoryCount > 50
+        riskScore -= 6
+    ELSE IF totalHistoryCount > 30
+        riskScore -= 4
+
+    # Transaction During Normal Hours
+    IF currentHour IN activeHours
+        riskScore -= 3
+
+    # Familiar Agent Location
+    IF currentAgentLocation IN homeAgentLocations
+        riskScore -= 3
+
+    ##################################################
+    ## 3. Amount Anomaly Rules
+    ##################################################
+
+    IF avgAmount > 0
+
+        IF transaction.Amount > avgAmount * 3
+            riskScore += 22
+            reasons += "Amount is 3x+ above customer average"
+
+        ELSE IF transaction.Amount > avgAmount * 2
+            riskScore += 14
+            reasons += "Amount is 2x above customer average"
+
+        ELSE IF transaction.Amount > maxAmount
+            riskScore += 10
+            reasons += "Amount exceeds customer's historical max"
+
+    ELSE
+        # New account with no history — treat higher amounts cautiously
+        IF transaction.Amount > SYSTEM_HIGH_VALUE_THRESHOLD
+            riskScore += 15
+            reasons += "High value transaction on new account"
+
+    END IF
+
+    ##################################################
+    ## 4. Velocity Rules
+    ##################################################
+
+    IF txns1Min >= 3
+        riskScore += 22
+        reasons += "3+ transactions in under 1 minute"
+        reviewRequired = TRUE
+
+    ELSE IF txns5Min >= 5
+        riskScore += 15
+        reasons += "5+ transactions in 5 minutes"
+
+    ELSE IF txns30Min >= 15
+        riskScore += 10
+        reasons += "Sustained high activity (30 min)"
+
+    ##################################################
+    ## 5. Repeated Same Amount (Time-Compressed)
+    ##################################################
+
+    IF sameAmt1Min >= 2
+        riskScore += 35
+        reasons += "Same amount repeated within 1 minute"
+        reviewRequired = TRUE
+
+    ELSE IF sameAmt5Min >= 3
+        riskScore += 25
+        reasons += "Same amount repeated 3+ times in 5 minutes"
+        reviewRequired = TRUE
+
+    ELSE IF sameAmt15Min >= 4
+        riskScore += 18
+        reasons += "Same amount repeated 4+ times in 15 minutes"
+
+    ELSE IF sameAmt30Min >= 6
+        riskScore += 12
+        reasons += "Sustained identical amount pattern (30 min)"
+
+    ##################################################
+    ## 6. Geographic / Agent Location Anomaly
+    ##################################################
+
+    IF currentAgentLocation NOT IN homeAgentLocations
+        riskScore += 10
+        reasons += "Transaction at unfamiliar agent location"
+
+    IF LENGTH(recentAgentLocations) >= 3
+        riskScore += 15
+        reasons += "Customer used 3+ different agent locations in 1 hour"
+        reviewRequired = TRUE
+
+    IF prevAgentID != NULL
+       AND prevAgentID != transaction.AgentID
+       AND DURATION(prevTime, transaction.Timestamp) < 10 MINUTES
+       AND distance(currentAgentLocation, getAgentLocation(prevAgentID)) > DISTANCE_THRESHOLD
+        riskScore += 25
+        reasons += "Impossible travel: different distant agents within minutes"
+        reviewRequired = TRUE
+
+    ##################################################
+    ## 7. Provider Switching
+    ##################################################
+
+    IF LENGTH(providersUsed) >= 3
+        riskScore += 15
+        reasons += "3+ providers used within 30 minutes"
+        reviewRequired = TRUE
+
+    ELSE IF LENGTH(providersUsed) == 2
+        riskScore += 5
+        reasons += "Provider switched recently"
+
+    ##################################################
+    ## 8. Channel Switching
+    ##################################################
+
+    IF prevChannel != NULL
+       AND prevChannel != transaction.Channel
+        riskScore += 5
+        reasons += "Channel changed from previous transaction"
+
+    ##################################################
+    ## 9. Transaction Type Patterns
+    ##################################################
+
+    IF transaction.Type == "CASH_OUT"
+       AND prevType == "CASH_IN"
+       AND DURATION(prevTime, transaction.Timestamp) < 5 MINUTES
+        riskScore += 22
+        reasons += "Rapid cash-in followed by cash-out"
+        reviewRequired = TRUE
+
+    # Round-tripping: repeated cash-in → cash-out cycles
+    cashInCount  = countTransactions(
+                       transaction.CustomerAccount,
+                       type="CASH_IN",
+                       window="30 minutes"
+                   )
+    cashOutCount = countTransactions(
+                       transaction.CustomerAccount,
+                       type="CASH_OUT",
+                       window="30 minutes"
+                   )
+    IF cashInCount >= 3 AND cashOutCount >= 3
+        riskScore += 20
+        reasons += "Round-tripping pattern: multiple cash-in/cash-out cycles"
+        reviewRequired = TRUE
+
+    ##################################################
+    ## 10. Failed Transaction Pattern
+    ##################################################
+
+    IF failedCount >= 5
+        riskScore += 20
+        reasons += "5+ failed attempts in 10 minutes"
+        reviewRequired = TRUE
+    ELSE IF failedCount >= 3
+        riskScore += 12
+        reasons += "Repeated failed attempts"
+
+    ##################################################
+    ## 11. Time Rules
+    ##################################################
+
+    IF currentHour NOT IN activeHours
+        riskScore += 8
+        reasons += "Transaction outside customer's normal hours"
+
+    # Late night surcharge (high risk window)
+    IF currentHour >= 0 AND currentHour <= 5
+        riskScore += 5
+        reasons += "Late night transaction (00:00–05:00)"
+
+    ##################################################
+    ## 12. Status Rules
+    ##################################################
+
+    IF transaction.Status == "FAILED"
+        riskScore += 5
+
+    IF transaction.Status == "REVERSED"
+        riskScore += 10
+        reasons += "Reversed transaction"
+
+    ##################################################
+    ## 13. New Account Behavior
+    ##################################################
+
+    IF totalHistoryCount < 5
+        IF transaction.Amount > SYSTEM_HIGH_VALUE_THRESHOLD
+            riskScore += 12
+            reasons += "New account with high value transaction"
+        IF txns5Min >= 2
+            riskScore += 10
+            reasons += "New account with rapid transactions"
+
+    ##################################################
+    ## 14. Clamp Score
+    ##################################################
+
+    IF riskScore < 0
+        riskScore = 0
+    IF riskScore > 100
+        riskScore = 100
+
+    ##################################################
+    ## 15. Risk Tier
+    ##################################################
+
+    IF riskScore < 25
+        tier = "LOW"
+    ELSE IF riskScore < 50
+        tier = "MEDIUM"
+    ELSE IF riskScore < 75
+        tier = "HIGH"
+    ELSE
+        tier = "CRITICAL"
+
+    ##################################################
+    ## 16. Final Review Decision
+    ##################################################
+
+    IF riskScore >= 60
+        reviewRequired = TRUE
+
+    IF tier == "CRITICAL"
+        reasons += "AUTO-BLOCK RECOMMENDED"
+        reviewRequired = TRUE
+
+    ##################################################
+    ## 17. Return
+    ##################################################
+
+    RETURN {
+        transactionId   : transaction.TransactionID,
+        customerAccount : transaction.CustomerAccount,
+        riskScore       : riskScore,
+        tier            : tier,
+        reviewRequired  : reviewRequired,
+        reasons         : reasons,
+        metadata        : {
+            avgAmount            : avgAmount,
+            maxAmount            : maxAmount,
+            totalHistory         : totalHistoryCount,
+            currentAgentLocation : currentAgentLocation,
+            providersUsed        : providersUsed,
+            velocities           : {
+                last1Min  : txns1Min,
+                last5Min  : txns5Min,
+                last30Min : txns30Min
+            }
+        }
+    }
